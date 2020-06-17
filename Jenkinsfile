@@ -2,10 +2,12 @@
 
 // FULL_BUILD -> true/false build parameter to define if we need to run the entire stack for lab purpose only
 final FULL_BUILD = params.FULL_BUILD
+// RUN_TESTS -> true/false, can be used to skip the tests, for lab purpose only
+final RUN_TESTS = params.RUN_TESTS
 // HOST_PROVISION -> server to run ansible based on provision/inventory.ini
 final HOST_PROVISION = params.HOST_PROVISION
 
-final GIT_URL = 'https://github.com/ricardozanini/soccer-stats.git'
+final GIT_URL = 'https://github.com/thomas-ferchau/soccer-stats.git'
 final NEXUS_URL = 'nexus.local:8081'
 
 stage('Build') {
@@ -22,7 +24,7 @@ stage('Build') {
     }
 }
 
-if(FULL_BUILD) {
+if(FULL_BUILD && RUN_TESTS) {
     stage('Unit Tests') {   
         node {
             withEnv(["PATH+MAVEN=${tool 'm3'}/bin"]) {
@@ -33,7 +35,7 @@ if(FULL_BUILD) {
     }
 }
 
-if(FULL_BUILD) {
+if(FULL_BUILD && RUN_TESTS) {
     stage('Integration Tests') {
         node {
             withEnv(["PATH+MAVEN=${tool 'm3'}/bin"]) {
@@ -44,7 +46,7 @@ if(FULL_BUILD) {
     }
 }
 
-if(FULL_BUILD) {
+if(FULL_BUILD && RUN_TESTS) {
     stage('Static Analysis') {
         node {
             withEnv(["PATH+MAVEN=${tool 'm3'}/bin"]) {
@@ -81,48 +83,45 @@ if(FULL_BUILD) {
             nexusArtifactUploader artifacts: [
                     [artifactId: "${pom.artifactId}", classifier: '', file: "target/${file}.war", type: 'war'],
                     [artifactId: "${pom.artifactId}", classifier: '', file: "${file}.pom", type: 'pom']
-                ], 
-                credentialsId: 'nexus', 
-                groupId: "${pom.groupId}", 
-                nexusUrl: NEXUS_URL, 
-                nexusVersion: 'nexus3', 
-                protocol: 'http', 
-                repository: 'ansible-meetup', 
-                version: "${pom.version}"        
+            ],
+                    credentialsId: 'nexus',
+                    groupId: "${pom.groupId}",
+                    nexusUrl: NEXUS_URL,
+                    nexusVersion: 'nexus3',
+                    protocol: 'http',
+                    repository: 'ansible-meetup',
+                    version: "${pom.version}"
         }
     }
 }
 
+if(FULL_BUILD) {
+    stage('Deploy') {
+        node {
+            def pom = readMavenPom file: "pom.xml"
+            def repoPath = "${pom.groupId}".replace(".", "/") +
+                    "/${pom.artifactId}"
 
-stage('Deploy') {
-    node {
-        def pom = readMavenPom file: "pom.xml"
-        def repoPath =  "${pom.groupId}".replace(".", "/") + 
-                        "/${pom.artifactId}"
+            def version = pom.version
 
-        def version = pom.version
+            if(!FULL_BUILD) { //takes the last version from repo - DOES NOT WORK, therefore added "if(FULL_BUILD)" above
+                sh "curl -o metadata.xml -s http://${NEXUS_URL}/repository/ansible-meetup/${repoPath}/maven-metadata.xml"
+                version = sh script: 'xmllint metadata.xml --xpath "string(//latest)"',
+                        returnStdout: true
+            }
+            def artifactUrl = "http://${NEXUS_URL}/repository/ansible-meetup/${repoPath}/${version}/${pom.artifactId}-${version}.war"
 
-        if(!FULL_BUILD) { //takes the last version from repo
-            sh "curl -o metadata.xml -s http://${NEXUS_URL}/repository/ansible-meetup/${repoPath}/maven-metadata.xml"
-            version = sh script: 'xmllint metadata.xml --xpath "string(//latest)"',
-                         returnStdout: true
-        }
-        def artifactUrl = "http://${NEXUS_URL}/repository/ansible-meetup/${repoPath}/${version}/${pom.artifactId}-${version}.war"
+            withEnv(["ARTIFACT_URL=${artifactUrl}", "APP_NAME=${pom.artifactId}"]) {
+                echo "The URL is ${env.ARTIFACT_URL} and the app name is ${env.APP_NAME}"
 
-        withEnv(["ARTIFACT_URL=${artifactUrl}", "APP_NAME=${pom.artifactId}"]) {
-            echo "The URL is ${env.ARTIFACT_URL} and the app name is ${env.APP_NAME}"
+                // install galaxy roles
+                sh "ansible-galaxy install -vvv -r provision/requirements.yml -p provision/roles/"
 
-            // install galaxy roles
-            sh "ansible-galaxy install -vvv -r provision/requirements.yml -p provision/roles/"        
-
-            ansiblePlaybook colorized: true, 
-            credentialsId: 'ssh-jenkins',
-            limit: "${HOST_PROVISION}",
-            installation: 'ansible',
-            inventory: 'provision/inventory.ini', 
-            playbook: 'provision/playbook.yml', 
-            sudo: true,
-            sudoUser: 'jenkins'
+                // execute ansible playbook (via sh because the Jenkins Ansible plugin uses wrong/old command line parameters of the ansible-playbook CLI)
+                withCredentials([sshUserPrivateKey(credentialsId: "ssh_jenkins", keyFileVariable: 'keyfile')]) {
+                    sh("ansible-playbook --private-key ${keyfile} --ssh-common-args=\"-o StrictHostKeyChecking=no\" --extra-vars \"ARTIFACT_URL=${env.ARTIFACT_URL} APP_NAME=${env.APP_NAME}\" --limit ${HOST_PROVISION} --inventory-file provision/inventory.ini --user jenkins --become provision/playbook.yml")
+                }
+            }
         }
     }
 }
